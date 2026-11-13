@@ -147,7 +147,8 @@ func TestShortDefaultAsksTheModelsOutput(t *testing.T) {
 // Translated onto another vendor's Chat or Responses, a request naming no
 // reply limit is sent its model's own, as on Anthropic's (#1792): the
 // client's API reads none as the model's whole, which the vendor's needn't.
-// A vendor that turns the figure away (a list saying more than it takes) is
+// A vendor that turns the figure away naming the limit it takes is asked
+// again within it, and fitted from then on. One that names no figure is
 // asked again naming none, as the client did, and from then on.
 func TestTranslatedAsksTheModelsOutput(t *testing.T) {
 	fresh(t)
@@ -190,16 +191,16 @@ func TestTranslatedAsksTheModelsOutput(t *testing.T) {
 	u.mu.Unlock()
 	got = ask()
 	if len(got) != 2 || got[0]["max_tokens"] != float64(65536) {
-		t.Fatalf("refused: %v, want 65536 then none", got)
+		t.Fatalf("refused: %v, want 65536 then 32768", got)
 	}
-	if _, ok := got[1]["max_tokens"]; ok {
-		t.Fatalf("asked again with a limit: %v", got[1])
+	if n, _ := got[1]["max_tokens"].(float64); int(n) != 32768 {
+		t.Fatalf("asked again with a limit: %v, want max_tokens 32768", got[1])
 	}
 	got = ask()
 	if len(got) != 1 {
-		t.Fatalf("after a refusal: %d requests, want 1 naming none", len(got))
+		t.Fatalf("after a refusal: %d requests, want 1", len(got))
 	}
-	if _, ok := got[0]["max_tokens"]; ok {
-		t.Fatalf("filled in again after the vendor turned it away: %v", got[0])
+	if n, _ := got[0]["max_tokens"].(float64); int(n) != 32768 {
+		t.Fatalf("filled in again over what the vendor said: %v", got[0])
 	}
 }

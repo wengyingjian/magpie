@@ -2,9 +2,13 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"log"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/tidwall/gjson"
 
@@ -336,6 +340,159 @@ func outputFieldRefused(status int, body []byte) bool {
 // away the reply limit magpie filled in: a request naming none is sent
 // none there from then on, as before.
 func outputFillRefused(model string) string { return "filled-output:" + model }
+
+// bodyOutput is the reply limit body, in proto's words, asks for: 0 when
+// it names none.
+func bodyOutput(proto provider.Protocol, body []byte) int {
+	switch proto {
+	case provider.Chat:
+		return max(int(gjson.GetBytes(body, "max_tokens").Int()), int(gjson.GetBytes(body, "max_completion_tokens").Int()))
+	case provider.Responses:
+		return int(gjson.GetBytes(body, "max_output_tokens").Int())
+	case provider.Anthropic:
+		return int(gjson.GetBytes(body, "max_tokens").Int())
+	case provider.Gemini:
+		return int(gjson.GetBytes(body, "generationConfig.maxOutputTokens").Int())
+	}
+	return 0
+}
+
+// outputCapWords are a vendor's words for the reply limit's field, whose
+// cap it may name beside them.
+var outputCapWords = lazyre.New(`(?i)max_output_tokens|max_completion_tokens|max_tokens|maxoutputtokens|max (output |completion )?tokens`)
+
+// outputCapDigits are the figures a refusal names.
+var outputCapDigits = lazyre.New(`\d{3,9}`)
+
+// outputCapSlack is how far from a mention of the reply limit's field its
+// cap may sit: pydantic names the field a sentence before its "less than
+// or equal to N", and OpenAI's "supports at most N completion tokens"
+// names it after the figure.
+const outputCapSlack = 120
+
+// leastOutputCap is the smallest figure read as a reply limit: a refusal
+// that names the range it takes ("the valid range of max_tokens is
+// [1, 8192]") names the least beside the cap.
+const leastOutputCap = 512
+
+// statedOutputCap is the reply limit a refusal says is the most it takes:
+// the smallest figure beside a mention of the limit's field that a reply
+// could hold and that the request asks more than (a refusal often names
+// the ask too: Anthropic's "max_tokens: 200000 > 64000, which is the
+// maximum allowed"). 0 when it names none.
+func statedOutputCap(errBody []byte, asked int) int {
+	if asked <= 0 {
+		return 0
+	}
+	w := wordsOf(errBody)
+	least := 0
+	for _, m := range outputCapWords.FindAllIndex(w, -1) {
+		n := leastFigure(w[m[1]:min(len(w), m[1]+outputCapSlack)], asked)
+		if n == 0 {
+			n = leastFigure(w[max(0, m[1]-outputCapSlack):m[1]], asked)
+		}
+		if n > 0 && (least == 0 || n < least) {
+			least = n
+		}
+	}
+	return least
+}
+
+// leastFigure is the smallest number in w that a reply could hold and that
+// the request asks more than: 0 when there is none.
+func leastFigure(w []byte, asked int) int {
+	least := 0
+	for _, m := range outputCapDigits.FindAll(w, -1) {
+		n, err := strconv.Atoi(string(m))
+		if err != nil || n < leastOutputCap || n >= asked {
+			continue
+		}
+		if least == 0 || n < least {
+			least = n
+		}
+	}
+	return least
+}
+
+// outputCaps are the reply limits providers said were the most they take,
+// by provider id and model, for as long as magpie runs. A vendor's figure
+// in a refusal is the one reply limit that is what it takes now: models.dev's
+// figure for a custom provider's model can be the model's, while the gateway
+// in front of it takes less (ebao's 128000 for deepseek-v4.1-flash, which
+// models.dev lists at 384000), and magpie published that larger one to the
+// agent.
+type outputCaps struct {
+	mu sync.Mutex
+	m  map[string]int
+}
+
+func (c *outputCaps) of(providerID, model string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[providerID+"\x00"+model]
+}
+
+// learn keeps the smaller of n and the limit known before.
+func (c *outputCaps) learn(providerID, model string, n int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]int{}
+	}
+	k := providerID + "\x00" + model
+	if old := c.m[k]; old > 0 && old <= n {
+		return old
+	}
+	c.m[k] = n
+	return n
+}
+
+// withinOutputCap is body as it goes to p: its reply limit lowered to the
+// one p's vendor said was the most it takes, when it turned a larger one
+// away before (outputCaps).
+func (s *Server) withinOutputCap(p provider.Provider, to provider.Protocol, model, path string, body []byte) []byte {
+	if countsTokens(path) {
+		return body
+	}
+	n := s.outputCaps.of(p.ID, model)
+	if n <= 0 {
+		return body
+	}
+	return withMaxOutput(to, body, n)
+}
+
+// refitOverOutput is forward's answer to res, a refusal of the reply limit
+// body asks for (outputFieldRefused): the limit the vendor says it takes
+// is learned for p's model, and the request asked again within it, so a
+// turn asking for more than a custom provider's gateway takes is answered
+// instead of failed every time it comes.
+func (s *Server) refitOverOutput(ctx context.Context, p provider.Provider, to provider.Protocol, model, path string, body []byte, in http.Header, res *http.Response) (*http.Response, error) {
+	for range 2 {
+		if res.StatusCode < 400 || countsTokens(path) {
+			return res, nil
+		}
+		b := peekError(res)
+		asked := bodyOutput(to, body)
+		if asked <= 0 || !outputFieldRefused(res.StatusCode, b) {
+			return res, nil
+		}
+		n := statedOutputCap(b, asked)
+		if n <= 0 {
+			return res, nil
+		}
+		if n = s.outputCaps.learn(p.ID, model, n); n >= asked {
+			return res, nil
+		}
+		log.Printf("%s: %s takes a reply of at most %d tokens, and %d was asked; asking again within it", p.Name, model, n, asked)
+		body = withMaxOutput(to, body, n)
+		res.Body.Close()
+		var err error
+		if res, err = s.forwardOnce(ctx, p, to, path, body, in); err != nil {
+			return res, err
+		}
+	}
+	return res, nil
+}
 
 // thinksByDefault is whether p's API runs a model's thinking on a request
 // that names none, and counts it in the reply limit: Tencent Cloud's
